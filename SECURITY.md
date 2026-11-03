@@ -74,9 +74,9 @@ threads before loading any worker libraries or executing worker code.
    sensitive appears in `/proc/<pid>/cmdline` or `ps`.
 2. **Resource limits (`setrlimit`):**
    - `RLIMIT_CORE = 0` (disables core dumps that could leak memory to disk).
-   - `RLIMIT_NOFILE = 256` (configurable via `Policy.MaxOpenFiles`, clamped to hard limit).
-   - `RLIMIT_AS = 4 GiB` (configurable via `Policy.MaxAddressSpace`, clamped to hard limit).
-   - `RLIMIT_NPROC = 64` (configurable via `Policy.MaxProcesses`, clamped to hard limit).
+   - `RLIMIT_NOFILE = 1024` (configurable via `Policy.MaxOpenFiles`, clamped to hard limit).
+   - `RLIMIT_AS = 16 GiB` (configurable via `Policy.MaxAddressSpace`, clamped to hard limit).
+   - `RLIMIT_NPROC = 4096` (configurable via `Policy.MaxProcesses`, clamped to hard limit).
 3. **Landlock (`syscall.AllThreadsSyscall`):**
    - Requires **Landlock ABI $\ge 3$** (`Probe().Available` is `false` on ABI
      1–2 because `LANDLOCK_ACCESS_FS_TRUNCATE` was introduced in ABI 3).
