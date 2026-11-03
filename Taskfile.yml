@@ -8,7 +8,7 @@ env:
 vars:
   EXE: '{{if eq OS "windows"}}.exe{{end}}'
   RACE: '{{if eq OS "darwin"}}-race{{end}}' # needs cgo on Linux
-  FUZZTIME: '1s'
+  FUZZTIME: '1000x'
 
 tasks:
   default:
@@ -131,9 +131,9 @@ tasks:
   fuzz:
     desc: Run fuzz targets briefly across root and pkg/confine
     cmds:
-      - go test -fuzz=FuzzVerifyLicenseKey -fuzztime={{.FUZZTIME}} .
-      - go test -fuzz=FuzzPolicyValidate -fuzztime={{.FUZZTIME}} .
-      - go -C pkg/confine test -fuzz=FuzzDecodeStageSpec -fuzztime={{.FUZZTIME}} .
+      - go test -run=^$ -fuzz=FuzzVerifyLicenseKey -fuzztime={{.FUZZTIME}} .
+      - go test -run=^$ -fuzz=FuzzPolicyValidate -fuzztime={{.FUZZTIME}} .
+      - go -C pkg/confine test -run=^$ -fuzz=FuzzDecodeStageSpec -fuzztime={{.FUZZTIME}} .
 
   test-sandbox-linux:
     desc: Run the sandbox tests on a Linux kernel in Docker

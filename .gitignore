@@ -2,5 +2,6 @@ bin/
 dist/
 .task/
 .DS_Store
+go.work.sum
 rust/ntconfine-client/target/
 rust/ntconfine-client/Cargo.lock

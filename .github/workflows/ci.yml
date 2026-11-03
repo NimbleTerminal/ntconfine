@@ -53,6 +53,6 @@ jobs:
           cmp THIRD_PARTY_NOTICES.md dist/THIRD_PARTY_NOTICES.md
       - name: Smoke fuzz
         run: |
-          go test -fuzz=FuzzVerifyLicenseKey -fuzztime=2s .
-          go test -fuzz=FuzzPolicyValidate -fuzztime=2s .
-          go -C pkg/confine test -fuzz=FuzzDecodeStageSpec -fuzztime=2s .
+          go test -run=^$ -fuzz=FuzzVerifyLicenseKey -fuzztime=1000x .
+          go test -run=^$ -fuzz=FuzzPolicyValidate -fuzztime=1000x .
+          go -C pkg/confine test -run=^$ -fuzz=FuzzDecodeStageSpec -fuzztime=1000x .
