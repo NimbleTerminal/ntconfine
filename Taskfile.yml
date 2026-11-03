@@ -1,0 +1,156 @@
+# ntconfine - Copyright (c) 2026 Neomantra Corp.
+version: '3'
+
+env:
+  CGO_ENABLED: '0'
+  GIT_PAGER: 'cat'
+
+vars:
+  EXE: '{{if eq OS "windows"}}.exe{{end}}'
+  RACE: '{{if eq OS "darwin"}}-race{{end}}' # needs cgo on Linux
+  FUZZTIME: '1s'
+
+tasks:
+  default:
+    desc: Build the library and stage binary
+    cmds:
+      - task: build
+
+  list:
+    desc: List available tasks
+    cmds:
+      - task --list-all
+
+  ci:
+    desc: Full preflight gate (fmt-check, whitespace-check, lint, check, build, fuzz)
+    cmds:
+      - task: fmt-check
+      - task: whitespace-check
+      - task: lint
+      - task: check
+      - task: build
+      - task: fuzz
+
+  fmt:
+    desc: Format Go source
+    cmds:
+      - gofmt -w .
+
+  fmt-check:
+    desc: Check Go formatting without changing files
+    cmds:
+      - |
+        files="$(gofmt -l .)"
+        if [ -n "$files" ]; then printf '%s\n' "$files"; exit 1; fi
+
+  whitespace-check:
+    desc: Check tracked files and pending changes for whitespace errors
+    cmds:
+      - git --no-pager diff --check "$(git hash-object -t tree /dev/null)"
+
+  build:
+    desc: Build everything and the stage binary into bin/
+    cmds:
+      - go build -mod=readonly ./...
+      - go -C pkg/confine build -mod=readonly ./...
+      - go build -mod=readonly -o bin/ntconfine-stage{{.EXE}} ./cmd/ntconfine-stage
+
+  test:
+    desc: Run the Go and Rust test suites
+    cmds:
+      - go test {{.RACE}} -count=1 ./...
+      - go -C pkg/confine test {{.RACE}} -count=1 ./...
+      - task: test-rust
+
+  test-rust:
+    desc: Build bin/ntconfine-stage and run the Rust client integration tests
+    cmds:
+      - |
+        if command -v cargo >/dev/null 2>&1; then
+          go build -mod=readonly -o bin/ntconfine-stage{{.EXE}} ./cmd/ntconfine-stage
+          cd rust/ntconfine-client && cargo test
+        elif command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+          GOOS=linux go build -mod=readonly -o bin/ntconfine-stage-linux ./cmd/ntconfine-stage
+          trap 'rm -f bin/ntconfine-stage-linux' EXIT
+          docker run --rm --security-opt seccomp=unconfined -e CARGO_TARGET_DIR=/tmp/cargo-target -e NTCONFINE_STAGE_BIN=/src/bin/ntconfine-stage-linux -v "$PWD":/src -w /src/rust/ntconfine-client rust:1-bookworm cargo test
+        else
+          echo "Skipping Rust tests: neither cargo nor a running docker daemon found"
+        fi
+
+  vet:
+    desc: go vet
+    cmds:
+      - go vet ./...
+      - go -C pkg/confine vet ./...
+
+  wasm:
+    desc: Compile the package for js/wasm
+    env:
+      GOOS: js
+      GOARCH: wasm
+    cmds:
+      - go build .
+      - go -C pkg/confine build ./...
+
+  windows:
+    desc: Cross-compile for windows/amd64
+    env:
+      GOOS: windows
+      GOARCH: amd64
+    cmds:
+      - go build ./...
+      - go -C pkg/confine build ./...
+      - go test -c . -o dist/ntconfine-windows.test.exe
+
+  linux:
+    desc: Cross-compile for linux/amd64 and linux/arm64
+    cmds:
+      - GOOS=linux GOARCH=amd64 go build ./...
+      - GOOS=linux GOARCH=arm64 go build ./...
+
+  notices:
+    desc: Regenerate THIRD_PARTY_NOTICES.md from the modules the binary links
+    cmds:
+      - go run ./internal/tools/notices > THIRD_PARTY_NOTICES.md
+
+  notices-check:
+    desc: Check generated notices without modifying tracked files
+    cmds:
+      - mkdir -p dist
+      - go run ./internal/tools/notices > dist/THIRD_PARTY_NOTICES.md
+      - cmp THIRD_PARTY_NOTICES.md dist/THIRD_PARTY_NOTICES.md
+
+  lint:
+    desc: Run golangci-lint across root and pkg/confine
+    cmds:
+      - golangci-lint run ./...
+      - GOOS=linux golangci-lint run ./...
+      - GOOS=windows golangci-lint run ./...
+      - cd pkg/confine && golangci-lint run ./...
+
+  fuzz:
+    desc: Run fuzz targets briefly across root and pkg/confine
+    cmds:
+      - go test -fuzz=FuzzVerifyLicenseKey -fuzztime={{.FUZZTIME}} .
+      - go test -fuzz=FuzzPolicyValidate -fuzztime={{.FUZZTIME}} .
+      - go -C pkg/confine test -fuzz=FuzzDecodeStageSpec -fuzztime={{.FUZZTIME}} .
+
+  test-sandbox-linux:
+    desc: Run the sandbox tests on a Linux kernel in Docker
+    cmds:
+      - docker run --rm -v "$PWD":/src -w /src -e CGO_ENABLED=0 -e NTCONFINE_REQUIRE_SANDBOX=1 --security-opt seccomp=unconfined golang:1.26 go test . -count=1
+
+  check:
+    desc: vet, test, wasm, windows, linux, notices-check
+    cmds:
+      - task: vet
+      - task: test
+      - task: wasm
+      - task: windows
+      - task: linux
+      - task: notices-check
+
+  clean:
+    desc: Remove generated binaries and dist artifacts
+    cmds:
+      - rm -rf bin dist

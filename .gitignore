@@ -1,0 +1,6 @@
+bin/
+dist/
+.task/
+.DS_Store
+rust/ntconfine-client/target/
+rust/ntconfine-client/Cargo.lock
