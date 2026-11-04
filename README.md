@@ -51,6 +51,25 @@ go get nimbleterminal.dev/ntconfine/pkg/confine@latest
 CGO_ENABLED=0 go build -o bin/ntconfine-stage ./cmd/ntconfine-stage
 ```
 
+## Binary releases
+
+Tagged `v*` releases publish `ntconfine-stage` archives for Linux and macOS
+(`amd64` and `arm64`), with SHA-256 checksums, usage documentation, and licenses.
+The macOS binaries are Developer ID signed and notarized. Windows remains a
+library cross-build target; there is no supported Windows confinement stage.
+
+The release workflow uses GoReleaser v2 (Pro is not required) and the checked-in
+`go.work` so both Go modules are built from the same commit. It requires the same
+GitHub secrets as gloss: `MACOS_SIGN_P12`, `MACOS_SIGN_PASSWORD`,
+`MACOS_NOTARY_KEY`, `MACOS_NOTARY_KEY_ID`, and `MACOS_NOTARY_ISSUER_ID`.
+Signing or notarization failures stop publication.
+
+Run `task release-check` to validate the configuration and `task release` to
+package an unsigned snapshot in `dist/` without publishing or using Apple
+credentials. Pull requests changing release configuration also build snapshots.
+Push a root-module `v*` tag to publish; `pkg/confine/v*` tags do not trigger
+binary releases.
+
 ## Quickstart
 
 ```go

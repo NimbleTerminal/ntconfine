@@ -1,0 +1,71 @@
+# yaml-language-server: $schema=https://goreleaser.com/static/schema.json
+# Keep the checked-in go.work active: both Go modules ship from this checkout.
+# Try packaging without publishing or signing with task release.
+version: 2
+
+project_name: ntconfine
+
+env:
+  - CGO_ENABLED=0
+
+metadata:
+  mod_timestamp: "{{ .CommitTimestamp }}"
+
+builds:
+  - id: ntconfine-stage
+    main: ./cmd/ntconfine-stage
+    binary: ntconfine-stage
+    goos: [linux, darwin]
+    goarch: [amd64, arm64]
+    flags:
+      - -trimpath
+      - -mod=readonly
+    ldflags:
+      - -s -w
+    mod_timestamp: "{{ .CommitTimestamp }}"
+
+archives:
+  - ids: [ntconfine-stage]
+    formats: [tar.gz]
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    files:
+      - README.md
+      - USAGE.md
+      - LICENSE
+      - LICENSE-COMMERCIAL.md
+      - THIRD_PARTY_NOTICES.md
+      - src: pkg/confine/LICENSE
+        dst: licenses/confine-LICENSE
+
+checksum:
+  name_template: checksums.txt
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^ci:"
+
+release:
+  github:
+    owner: NimbleTerminal
+    name: ntconfine
+  prerelease: auto
+
+# Only Darwin binaries are signed. The stage needs no extra entitlements.
+# Real releases require signing; snapshots explicitly skip notarization.
+notarize:
+  macos:
+    - enabled: "{{ not .IsSnapshot }}"
+      ids: [ntconfine-stage]
+      sign:
+        certificate: "{{ .Env.MACOS_SIGN_P12 }}"
+        password: "{{ .Env.MACOS_SIGN_PASSWORD }}"
+      notarize:
+        issuer_id: "{{ .Env.MACOS_NOTARY_ISSUER_ID }}"
+        key_id: "{{ .Env.MACOS_NOTARY_KEY_ID }}"
+        key: "{{ .Env.MACOS_NOTARY_KEY }}"
+        wait: true
+        timeout: 20m
