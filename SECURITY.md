@@ -41,8 +41,11 @@ executables:
    - Rejects empty `ExecPaths` and caps path list counts (`<= 128` per list) and
      total path bytes (`<= 32768`).
    - Requires every path in `ReadPaths`, `WritePaths`, and `ExecPaths` to be
-     non-empty, valid UTF-8, free of NUL and control characters (`< 0x20` or
-     `0x7f`), clean (`filepath.Clean(p) == p`), and absolute.
+     non-empty, valid UTF-8, free of NUL and control characters (`< 0x20`,
+     `0x7f`, or C1 `0x80`–`0x9f`), clean (`filepath.Clean(p) == p`, so no `.` or
+     `..` elements and no repeated or trailing separators), and absolute.
+   - The same path check applies to `WorkerPath` and the stage binary path, and
+     the Rust client's `StageSpec::validate` mirrors it.
 3. **`VerifyBinary` & `ResolveSibling`:**
    - `ResolveSibling` resolves a bare binary name strictly inside
      `filepath.Dir(evalSymlinks(os.Executable()))` and **never** searches `$PATH`.
@@ -57,7 +60,7 @@ executables:
 
 ## 3. Linux Confinement Perimeter (`landlock+seccomp`)
 
-On Linux (kernel $\ge 5.13$ with Landlock ABI $\ge 3$), `ntconfine` launches a
+On Linux (kernel $\ge 6.2$ with Landlock ABI $\ge 3$), `ntconfine` launches a
 small, pure-Go (`CGO_ENABLED=0`) stage process (`ntconfine-stage` or self-reexec
 via `--stage fd:<N>`) before `execve`ing the worker.
 
@@ -70,7 +73,8 @@ threads before loading any worker libraries or executing worker code.
 ### Stage lockdown sequence (`RunStagePolicy`)
 1. **No policy paths in `argv`:** The parent passes the base64url-encoded JSON
    `StageSpec` over an inherited anonymous pipe (`--stage fd:<N>`) capped at
-   `64 KiB`, and closes the descriptor immediately after reading. Nothing
+   `1 MiB` (`MaxSpecBytes`, enforced when encoding and when reading), and
+   closes the descriptor immediately after reading. Nothing
    sensitive appears in `/proc/<pid>/cmdline` or `ps`.
 2. **Resource limits (`setrlimit`):**
    - `RLIMIT_CORE = 0` (disables core dumps that could leak memory to disk).
@@ -78,8 +82,10 @@ threads before loading any worker libraries or executing worker code.
    - `RLIMIT_AS = 16 GiB` (configurable via `Policy.MaxAddressSpace`, clamped to hard limit).
    - `RLIMIT_NPROC = 4096` (configurable via `Policy.MaxProcesses`, clamped to hard limit).
 3. **Landlock (`syscall.AllThreadsSyscall`):**
-   - Requires **Landlock ABI $\ge 3$** (`Probe().Available` is `false` on ABI
-     1–2 because `LANDLOCK_ACCESS_FS_TRUNCATE` was introduced in ABI 3).
+   - Requires **Landlock ABI $\ge 3$** (Linux 6.2+). On ABI 1–2, which lack
+     `LANDLOCK_ACCESS_FS_TRUNCATE`, `Probe().Available` is `false`,
+     `Probe().Detail` names the kernel's ABI, and `StartHelper`, `Command`, and
+     the stage fail closed with `ErrUnavailable`.
    - Handles filesystem access bits up to ABI 9 (including
      `LANDLOCK_ACCESS_FS_TRUNCATE`, `LANDLOCK_ACCESS_FS_IOCTL_DEV`, and ABI 9's
      `LANDLOCK_ACCESS_FS_RESOLVE_UNIX`), network masks (`LANDLOCK_ACCESS_NET_BIND_TCP`,
@@ -89,7 +95,7 @@ threads before loading any worker libraries or executing worker code.
    - Canonicalizes every existing path with `filepath.EvalSymlinks` before
      adding `path_beneath` rules:
      - `ReadPaths`: read-only (`READ_FILE | READ_DIR`).
-     - `WritePaths`: read-write (`READ_FILE | READ_DIR | WRITE_FILE | REMOVE_DIR | REMOVE_FILE | MAKE_CHAR | MAKE_DIR | MAKE_REG | MAKE_SOCK | MAKE_FIFO | MAKE_BLOCK | MAKE_SYM | REFER | TRUNCATE`).
+     - `WritePaths`: read-write (`READ_FILE | READ_DIR | WRITE_FILE | REMOVE_DIR | REMOVE_FILE | MAKE_DIR | MAKE_REG | MAKE_SYM | REFER | TRUNCATE`). Creating device nodes, sockets, and FIFOs (`MAKE_CHAR`, `MAKE_BLOCK`, `MAKE_SOCK`, `MAKE_FIFO`) is not granted.
      - `ExecPaths` + `workerPath`: read + execute (`READ_FILE | READ_DIR | EXECUTE`).
      - `/dev/null`: file read-write (`READ_FILE | WRITE_FILE | TRUNCATE`).
    - Enforces `prctl(PR_SET_NO_NEW_PRIVS, 1)` and `landlock_restrict_self` across
@@ -99,7 +105,7 @@ threads before loading any worker libraries or executing worker code.
      architecture mismatch and rejecting x32 ABI syscalls `>= 0x40000000` on amd64).
    - Returns `ENOSYS` for `clone3` so `glibc` cleanly falls back to `clone(2)`.
    - Inspects `clone(2)` flags (`arg0` on `amd64`/`arm64`) and returns `EPERM` if
-     any `CLONE_NEW*` namespace bit (`0x7e020000`) is set, while permitting
+     any `CLONE_NEW*` namespace bit (`0x7e020080`) is set, while permitting
      normal thread creation (`CLONE_VM | CLONE_THREAD | ...`).
    - Inspects `tgkill(2)` and `tkill()` and returns `EPERM` unless `tgid == os.Getpid()`
      (for `tgkill`), blocking cross-process thread signaling even on kernels
@@ -120,10 +126,12 @@ threads before loading any worker libraries or executing worker code.
      - **Kernel attack surface & keyrings:** `bpf`, `io_uring_setup`,
        `io_uring_enter`, `io_uring_register`, `userfaultfd`, `perf_event_open`,
        `kexec_load`, `kexec_file_load`, `keyctl`, `add_key`, `request_key`.
-     - **Filesystem metadata mutation:** `truncate`, `ftruncate`, `chmod`,
+     - **Filesystem metadata mutation:** `truncate`, `chmod`,
        `fchmod`, `fchmodat`, `fchmodat2`, `chown`, `lchown`, `fchown`,
        `fchownat`, `utime`, `utimes`, `futimesat`, `utimensat`, `setxattr`,
        `lsetxattr`, `fsetxattr`, `removexattr`, `lremovexattr`, `fremovexattr`.
+       `ftruncate` is **not** in this list: it needs a descriptor already open
+       for writing, which Landlock only permits under `Policy.WritePaths`.
 5. **Irreversible post-`restrict()` failure handling:** Once `landlock_restrict_self`
    succeeds, `RunStagePolicy` never returns to an in-process caller; if
    `seccomp-bpf` or `execve` fails, it writes to `stderr` and calls `os.Exit(1)`.
@@ -149,13 +157,14 @@ On macOS, `ntconfine` generates a Seatbelt (`(version 1)`) profile via
 3. **Closed metadata (`stat`) on `/Users` and `/private/etc`:** `HelperPolicy`
    does **not** emit a global `(allow file-read-metadata)`. Instead, it grants
    `file-read-metadata` only on exact `literal` ancestor directories of the
-   policy's allowed paths (plus `/`, `/tmp`, `/var`, `/private`, `/System`,
-   `/Library`, `/opt`, `/usr`). Both `open(2)` and `stat(2)` on `/etc/passwd`,
+   policy's allowed paths (plus `/tmp`, `/var`, and `/private`; `/` itself is
+   readable through `dyld-support.sb`). Both `open(2)` and `stat(2)` on `/etc/passwd`,
    `$HOME`, and `~/.ssh` fail with `EPERM`.
 4. **Denied capabilities:** Network (`(deny network*)`), Mach lookup/register
    (`(deny mach-lookup)` / `(deny mach-register)`), POSIX shared memory
    (`(deny ipc-posix-shm*)`), core dumps (`(deny file-write* (subpath "/cores"))`),
-   and controlling terminal (`(deny file-read* file-write* (literal "/dev/tty"))`).
+   and controlling terminal (`(deny file-read* file-write* (literal "/dev/tty"))`,
+   emitted after the path allows).
 5. **Known OS caveats (`Probe().Deprecated == true`):**
    - Apple marks `/usr/bin/sandbox-exec` as deprecated.
    - The Darwin kernel does not enforce `setrlimit(RLIMIT_AS)`. Hosts on macOS
@@ -181,8 +190,11 @@ On macOS, `ntconfine` generates a Seatbelt (`(version 1)`) profile via
   IPC connection, send `SIGKILL` to both `-pid` (the entire process group) and
   `pid`, and reap the child with `Wait()`.
 - **Bounded, sanitized `stderr`:** Worker `stderr` is captured into a 64 KiB
-  `BoundedBuffer` that strips ANSI CSI/OSC sequences, C0/C1 controls, DEL, and
-  Unicode bidi overrides before returning `Helper.Stderr()`.
+  `BoundedBuffer` (`MaxStderrBytes`). `Helper.Stderr()`, `Process.Stderr()`, and
+  the Rust `Process::stderr()` return it through `SanitizeTerminalText`, which
+  removes whole ANSI escape sequences (CSI, OSC, DCS, SOS, PM, APC), all other
+  C0/C1 controls except newline and tab, DEL, Unicode bidi marks, embeddings,
+  overrides, and isolates, and invalid UTF-8.
 
 ---
 

@@ -128,7 +128,7 @@ Rust client (`ntconfine-client`), and C++ / Python host and worker examples.
 
 | Platform | `Probe().Mechanism` | Enforcement summary |
 | --- | --- | --- |
-| **Linux** (kernel $\ge$ 5.13) | `landlock+seccomp` | Landlock (ABI v3–v10), `rlimits` (`CORE=0`, `NOFILE`, `AS`, `NPROC`), and `seccomp-bpf` (`SECCOMP_FILTER_TSYNC`) applied across all OS threads before `execve` |
+| **Linux** (kernel $\ge$ 6.2) | `landlock+seccomp` | Landlock (ABI v3–v10), `rlimits` (`CORE=0`, `NOFILE`, `AS`, `NPROC`), and `seccomp-bpf` (`SECCOMP_FILTER_TSYNC`) applied across all OS threads before `execve` |
 | **macOS** | `sandbox-exec` (`Deprecated: true`) | Seatbelt profile (`dyld-support.sb`) written to a `0600` temp file denying network, Mach lookup/register, POSIX SHM, `/Users`, `/private/etc` (both data and `stat` metadata), `/dev/tty`, and file writes |
 | **Windows / other** | `none` | `Probe().Available == false`. Fails closed with `ErrUnavailable` unless `Policy.AllowUnsandboxed` is explicitly `true` |
 
