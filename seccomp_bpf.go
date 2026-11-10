@@ -81,7 +81,7 @@ func compileSeccompProgram(calls []uintptr, cloneNR, clone3NR, openNR, openatNR,
 	// Block open(2) and openat(2) with O_TRUNC. Landlock ABI >= 3 (the minimum
 	// accepted) already enforces LANDLOCK_ACCESS_FS_TRUNCATE; this is kept as a
 	// second layer so open(path, O_RDONLY|O_TRUNC) never truncates a readable file.
-	if openNR != ^uint32(0) {
+	if openNR != noSyscall {
 		prog = append(prog,
 			sockFilter{Code: bpfJMP | bpfJEQ | bpfK, JT: 0, JF: 4, K: openNR},
 			sockFilter{Code: bpfLD | bpfW | bpfABS, K: seccompOffArg1Lo},

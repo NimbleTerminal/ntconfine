@@ -19,7 +19,9 @@ import (
 	"nimbleterminal.dev/ntconfine/pkg/confine"
 )
 
-// Landlock constants from linux/landlock.h and asm-generic/unistd.h.
+// Syscall numbers and flags used only on Linux. The Landlock rights, ABI
+// thresholds, and rlimit defaults live in landlock_rights.go so every platform
+// can check them and render them into SECURITY.md.
 const (
 	sysLandlockCreateRuleset = 444
 	sysLandlockAddRule       = 445
@@ -28,67 +30,12 @@ const (
 	landlockCreateRulesetVersion = 1 << 0
 	landlockRulePathBeneath      = 1
 
-	accessExecute     = 1 << 0
-	accessWriteFile   = 1 << 1
-	accessReadFile    = 1 << 2
-	accessReadDir     = 1 << 3
-	accessRemoveDir   = 1 << 4
-	accessRemoveFile  = 1 << 5
-	accessMakeChar    = 1 << 6
-	accessMakeDir     = 1 << 7
-	accessMakeReg     = 1 << 8
-	accessMakeSock    = 1 << 9
-	accessMakeFifo    = 1 << 10
-	accessMakeBlock   = 1 << 11
-	accessMakeSym     = 1 << 12
-	accessRefer       = 1 << 13
-	accessTruncate    = 1 << 14
-	accessIoctlDev    = 1 << 15
-	accessResolveUnix = 1 << 16
-
-	accessFS    = (1 << 17) - 1
-	accessRead  = accessReadFile | accessReadDir
-	accessDirRW = accessRead | accessWriteFile | accessRemoveDir | accessRemoveFile |
-		accessMakeReg | accessMakeDir | accessMakeSym | accessRefer | accessTruncate
-	accessFileRW = accessReadFile | accessWriteFile | accessTruncate
-
-	netBindTCP    = 1 << 0
-	netConnectTCP = 1 << 1
-	netBindUDP    = 1 << 2
-	netConnectUDP = 1 << 3
-	accessNetTCP  = netBindTCP | netConnectTCP
-	accessNetAll  = accessNetTCP | netBindUDP | netConnectUDP
-
-	scopeAbstractUnixSocket = 1 << 0
-	scopeSignal             = 1 << 1
-	scopeAll                = scopeAbstractUnixSocket | scopeSignal
-
-	// minLandlockABI is the lowest Landlock ABI accepted (Linux 6.2). ABI 3
-	// added LANDLOCK_ACCESS_FS_TRUNCATE; older kernels fail closed as unavailable.
-	minLandlockABI = 3
-
 	prSetNoNewPrivs = 38
 	fSetPipeSz      = 1031 // F_SETPIPE_SZ
 	oPath           = 0x200000
 
-	rlimitNproc            = 6
-	defaultMaxAddressSpace = 16 << 30 // 16 GiB virtual address space ceiling
-	defaultMaxOpenFiles    = 1024
-	defaultMaxProcesses    = 4096 // per-UID task ceiling on Linux (matches Policy doc)
+	rlimitNproc = 6
 )
-
-var fsMaskForABI = [...]uint64{
-	1:  (1 << 13) - 1,
-	2:  (1 << 14) - 1,
-	3:  (1 << 15) - 1,
-	4:  (1 << 15) - 1,
-	5:  (1 << 16) - 1,
-	6:  (1 << 16) - 1,
-	7:  (1 << 16) - 1,
-	8:  (1 << 16) - 1,
-	9:  (1 << 16) - 1 | accessResolveUnix,
-	10: (1 << 16) - 1 | accessResolveUnix,
-}
 
 type rulesetAttr struct {
 	handledAccessFS  uint64
@@ -146,7 +93,7 @@ func Probe() Support {
 	}
 	detail := "Linux Landlock is unavailable on this kernel"
 	if abi >= 1 {
-		detail = fmt.Sprintf("Linux Landlock ABI v%d is too old (ABI v%d / Linux 6.2 or newer is required)", abi, minLandlockABI)
+		detail = fmt.Sprintf("Linux Landlock ABI v%d is too old (ABI v%d / Linux %s or newer is required)", abi, minLandlockABI, minLandlockKernel)
 	}
 	return Support{
 		Available:  false,
@@ -206,9 +153,9 @@ func newRuleset(denyNet bool) (*ruleset, error) {
 	for {
 		attr := rulesetAttr{handledAccessFS: fsMaskForABI[abi]}
 		size := unsafe.Sizeof(attr.handledAccessFS)
-		if abi >= 4 {
+		if abi >= netTCPMinABI {
 			if denyNet {
-				if abi >= 10 {
+				if abi >= netUDPMinABI {
 					attr.handledAccessNet = accessNetAll
 				} else {
 					attr.handledAccessNet = accessNetTCP
@@ -216,7 +163,7 @@ func newRuleset(denyNet bool) (*ruleset, error) {
 			}
 			size += unsafe.Sizeof(attr.handledAccessNet)
 		}
-		if abi >= 6 {
+		if abi >= scopeMinABI {
 			attr.scoped = scopeAll
 			size += unsafe.Sizeof(attr.scoped)
 		}
@@ -224,8 +171,8 @@ func newRuleset(denyNet bool) (*ruleset, error) {
 		if errno == 0 {
 			return &ruleset{fd: int(fd), mask: attr.handledAccessFS}, nil
 		}
-		if errno == syscall.EINVAL && abi > 6 {
-			abi = 6
+		if errno == syscall.EINVAL && abi > fallbackABI {
+			abi = fallbackABI
 			continue
 		}
 		return nil, fmt.Errorf("landlock create ruleset: %w", errno)
@@ -252,7 +199,7 @@ func (r *ruleset) add(path string, access uint64) error {
 		return err
 	}
 	if st.Mode&syscall.S_IFMT != syscall.S_IFDIR {
-		access &= accessFileRW | accessExecute | accessIoctlDev
+		access &= accessFileMask
 	}
 	attr := pathBeneathAttr{allowedAccess: access & r.mask, parentFD: int32(fd)}
 	_, _, errno := syscall.Syscall6(sysLandlockAddRule, uintptr(r.fd), landlockRulePathBeneath, uintptr(unsafe.Pointer(&attr)), 0, 0, 0)
@@ -351,24 +298,6 @@ func helperCommand(cfg HelperConfig, workerPath string, ephemeral bool) (*exec.C
 	return cmd, nil, nil
 }
 
-// deniedHelper adds socket, pidfd/cross-process inspection, openat2, and signal
-// delivery syscalls to the syscalls denied after stage lockdown. tgkill and
-// tkill are filtered by PID in buildSeccompProgram so the Go runtime can signal
-// its own threads while cross-process signaling is blocked even on kernels < 6.12
-// without Landlock ABI 6. execve stays allowed so the stage can exec the worker;
-// Landlock restricts execution to Policy.ExecPaths.
-var deniedHelper = append([]uintptr{
-	sysSocket,
-	sysKill,
-	sysRtSigqueueinfo,
-	sysRtTgsigqueueinfo,
-	sysPidfdSendSignal,
-	sysPidfdOpen,
-	sysPidfdGetfd,
-	sysProcessMadvise,
-	sysOpenat2,
-}, deniedBase...)
-
 // RunStage parses the encoded stage specification from args (either via an
 // inherited pipe descriptor "fd:<N>" or an inline base64 token), confines all OS
 // threads of the current process with Landlock, rlimits, and seccomp-bpf, and
@@ -460,12 +389,12 @@ func RunStagePolicy(pol Policy, workerPath string, workerArgs []string) error {
 		return err
 	}
 	for _, p := range pol.ReadPaths {
-		if err := r.add(p, accessRead); err != nil {
+		if err := r.add(p, accessReadPath); err != nil {
 			return err
 		}
 	}
 	for _, p := range pol.WritePaths {
-		if err := r.add(p, accessDirRW); err != nil {
+		if err := r.add(p, accessWritePath); err != nil {
 			return err
 		}
 	}
@@ -474,11 +403,11 @@ func RunStagePolicy(pol Policy, workerPath string, workerArgs []string) error {
 		execPaths = append(slices.Clone(execPaths), resolvedWorker)
 	}
 	for _, p := range execPaths {
-		if err := r.add(p, accessRead|accessExecute); err != nil {
+		if err := r.add(p, accessExecPath); err != nil {
 			return err
 		}
 	}
-	if err := r.add("/dev/null", accessFileRW); err != nil {
+	if err := r.add("/dev/null", accessDevNull); err != nil {
 		return err
 	}
 	if err := r.restrict(); err != nil {
@@ -487,7 +416,7 @@ func RunStagePolicy(pol Policy, workerPath string, workerArgs []string) error {
 	// Once restrict() succeeds, NO_NEW_PRIVS and the Landlock domain are
 	// irreversible on all threads. Never return to an in-process caller in a
 	// half-confined state without the seccomp filter.
-	if err := denySyscalls(deniedHelper); err != nil {
+	if err := denySyscalls(); err != nil {
 		fmt.Fprintln(os.Stderr, "ntconfine:", err)
 		os.Exit(1)
 	}
