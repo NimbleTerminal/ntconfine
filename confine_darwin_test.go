@@ -30,7 +30,8 @@ func TestDarwinHelperPolicyHardening(t *testing.T) {
 		"(deny mach-lookup)",
 		"(deny mach-register)",
 		"(deny ipc-posix-shm*)",
-		"(deny file-write-create (prefix \"/cores/\"))",
+		"(deny file-write* (subpath \"/cores\"))",
+		"(deny file-read* file-write* (literal \"/dev/tty\"))",
 		"(deny file-read* file-test-existence (subpath \"/private/etc\") (subpath \"/etc\") (subpath \"/Users\") (subpath \"/private/var/root\"))",
 	} {
 		if !strings.Contains(sbpl, mustContain) {

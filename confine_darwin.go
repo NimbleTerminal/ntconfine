@@ -135,7 +135,7 @@ func HelperPolicy(pol Policy) string {
 	w("(deny mach-lookup)")
 	w("(deny mach-register)")
 	w("(deny ipc-posix-shm*)")
-	w("(deny file-write-create (prefix \"/cores/\"))")
+	w("(deny file-write* (subpath \"/cores\"))")
 	w("(deny file-read* file-test-existence (subpath \"/private/etc\") (subpath \"/etc\") (subpath \"/Users\") (subpath \"/private/var/root\"))")
 
 	var execLiterals []string
@@ -199,6 +199,9 @@ func HelperPolicy(pol Policy) string {
 
 	w("(allow file-read* file-write* file-test-existence (literal \"/dev/null\"))")
 	w("(allow file-read* file-test-existence (literal \"/dev/urandom\") (literal \"/dev/random\"))")
+	// Explicit denies last, so they hold even if a caller lists /dev or a
+	// parent directory in ReadPaths or WritePaths.
+	w("(deny file-read* file-write* (literal \"/dev/tty\"))")
 	w("(deny network*)")
 	return b.String()
 }
