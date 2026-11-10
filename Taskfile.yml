@@ -134,6 +134,7 @@ tasks:
       - go test -run=^$ -fuzz=FuzzVerifyLicenseKey -fuzztime={{.FUZZTIME}} .
       - go test -run=^$ -fuzz=FuzzPolicyValidate -fuzztime={{.FUZZTIME}} .
       - go -C pkg/confine test -run=^$ -fuzz=FuzzDecodeStageSpec -fuzztime={{.FUZZTIME}} .
+      - go -C pkg/confine test -run=^$ -fuzz=FuzzSanitizeTerminalText -fuzztime={{.FUZZTIME}} .
 
   test-sandbox-linux:
     desc: Run the sandbox tests on a Linux kernel in Docker

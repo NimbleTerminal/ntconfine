@@ -56,3 +56,4 @@ jobs:
           go test -run=^$ -fuzz=FuzzVerifyLicenseKey -fuzztime=1000x .
           go test -run=^$ -fuzz=FuzzPolicyValidate -fuzztime=1000x .
           go -C pkg/confine test -run=^$ -fuzz=FuzzDecodeStageSpec -fuzztime=1000x .
+          go -C pkg/confine test -run=^$ -fuzz=FuzzSanitizeTerminalText -fuzztime=1000x .

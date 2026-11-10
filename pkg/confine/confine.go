@@ -31,7 +31,13 @@ const (
 	MaxSpecBytes = 1 << 20
 
 	// MaxStderrBytes is the maximum stderr output retained from a stage or worker process.
-	MaxStderrBytes = 16 << 10
+	MaxStderrBytes = 64 << 10
+
+	// MaxPolicyPaths is the maximum number of entries in each Policy path list.
+	MaxPolicyPaths = 128
+
+	// MaxPolicyPathBytes is the maximum total byte length of all Policy paths.
+	MaxPolicyPathBytes = 32768
 )
 
 // ErrUnavailable means this machine cannot enforce the requested OS sandbox policy.
@@ -51,7 +57,7 @@ const (
 type Support struct {
 	Available   bool
 	Mechanism   Mechanism
-	LandlockABI int    // 1..6 on Linux when Available; 0 elsewhere
+	LandlockABI int    // 3..10 on Linux when Available (capped at the highest ABI this package handles); 0 elsewhere
 	Deprecated  bool   // true on macOS: Apple deprecated sandbox-exec
 	Detail      string // human-readable summary of enforcement and caveats
 }
@@ -74,7 +80,9 @@ type Policy struct {
 }
 
 // ValidateCleanAbsPath checks that path is a non-empty, absolute, valid UTF-8
-// filesystem path with no C0/C1 control characters or DEL.
+// filesystem path with no C0/C1 control characters or DEL, and that it is
+// already in filepath.Clean form (no "." or ".." elements, repeated separators,
+// or trailing separator).
 func ValidateCleanAbsPath(path string) error {
 	if path == "" || !filepath.IsAbs(path) || !utf8.ValidString(path) {
 		return fmt.Errorf("ntconfine: invalid path %q (must be absolute valid UTF-8)", path)
@@ -84,16 +92,31 @@ func ValidateCleanAbsPath(path string) error {
 			return fmt.Errorf("ntconfine: control character in path %q", path)
 		}
 	}
+	// Forward slashes are accepted as written on Windows, where Clean rewrites them.
+	if clean := filepath.Clean(path); clean != path && filepath.ToSlash(clean) != path {
+		return fmt.Errorf("ntconfine: path %q is not clean (want %q)", path, clean)
+	}
 	return nil
 }
 
-// Validate checks that the policy is well-formed and not the closed zero value.
+// Validate checks that the policy is well-formed and not the closed zero value:
+// ExecPaths is non-empty, each path list holds at most MaxPolicyPaths entries,
+// all paths together are at most MaxPolicyPathBytes bytes, and every path
+// passes ValidateCleanAbsPath.
 func (p Policy) Validate() error {
 	if len(p.ExecPaths) == 0 {
 		return errors.New("ntconfine: policy has no executable paths")
 	}
+	total := 0
 	for _, list := range [][]string{p.ReadPaths, p.WritePaths, p.ExecPaths} {
+		if len(list) > MaxPolicyPaths {
+			return fmt.Errorf("ntconfine: policy path list has %d entries (max %d)", len(list), MaxPolicyPaths)
+		}
 		for _, path := range list {
+			total += len(path)
+			if total > MaxPolicyPathBytes {
+				return fmt.Errorf("ntconfine: policy paths exceed %d bytes in total", MaxPolicyPathBytes)
+			}
 			if err := ValidateCleanAbsPath(path); err != nil {
 				return err
 			}
@@ -119,6 +142,9 @@ func EncodeStageSpec(spec StageSpec) (string, error) {
 	raw, err := json.Marshal(spec)
 	if err != nil {
 		return "", err
+	}
+	if base64.RawURLEncoding.EncodedLen(len(raw)) > MaxSpecBytes {
+		return "", fmt.Errorf("ntconfine: encoded stage spec exceeds %d bytes", MaxSpecBytes)
 	}
 	return base64.RawURLEncoding.EncodeToString(raw), nil
 }
@@ -196,7 +222,7 @@ func (b *BoundedBuffer) Write(p []byte) (int, error) {
 	return origLen, nil
 }
 
-// String returns the captured contents with C0/C1 controls and DEL stripped.
+// String returns the captured contents sanitized with SanitizeTerminalText.
 func (b *BoundedBuffer) String() string {
 	if b == nil {
 		return ""
@@ -204,12 +230,86 @@ func (b *BoundedBuffer) String() string {
 	b.mu.Lock()
 	raw := b.buf.String()
 	b.mu.Unlock()
+	return SanitizeTerminalText(raw)
+}
+
+// SanitizeTerminalText makes untrusted process output safe to print on a
+// terminal. It removes whole ANSI escape sequences (CSI, OSC, DCS, SOS, PM,
+// APC, and two-byte ESC sequences), every remaining C0/C1 control character
+// except newline and tab, DEL, Unicode bidirectional formatting controls, and
+// invalid UTF-8, then trims surrounding whitespace.
+func SanitizeTerminalText(raw string) string {
 	var out strings.Builder
 	out.Grow(len(raw))
-	for _, r := range raw {
-		if r == '\n' || r == '\t' || (r >= 0x20 && r != 0x7f && (r < 0x80 || r > 0x9f)) {
+	rs := []rune(raw)
+	for i := 0; i < len(rs); i++ {
+		r := rs[i]
+		switch {
+		case r == 0x1b && i+1 < len(rs):
+			i = skipEscapeSequence(rs, i+1)
+		case r == 0x9b: // C1 CSI
+			i = skipCSI(rs, i+1)
+		case r == 0x90 || r == 0x98 || r == 0x9d || r == 0x9e || r == 0x9f: // C1 DCS, SOS, OSC, PM, APC
+			i = skipStringSequence(rs, i+1)
+		case r == utf8.RuneError, isBidiControl(r):
+		case r == '\n' || r == '\t' || (r >= 0x20 && r != 0x7f && (r < 0x80 || r > 0x9f)):
 			out.WriteRune(r)
 		}
 	}
 	return strings.TrimSpace(out.String())
+}
+
+// skipEscapeSequence consumes the sequence introduced by an ESC whose next
+// rune is rs[i] and returns the index of its last rune.
+func skipEscapeSequence(rs []rune, i int) int {
+	switch rs[i] {
+	case '[':
+		return skipCSI(rs, i+1)
+	case ']', 'P', 'X', '^', '_':
+		return skipStringSequence(rs, i+1)
+	}
+	// nF sequences: intermediates 0x20..0x2f followed by one final byte.
+	for i < len(rs) && rs[i] >= 0x20 && rs[i] <= 0x2f {
+		i++
+	}
+	if i < len(rs) && rs[i] >= 0x30 && rs[i] <= 0x7e {
+		return i
+	}
+	return i - 1
+}
+
+// skipCSI consumes CSI parameter and intermediate bytes starting at rs[i] and
+// the final byte, returning the index of the last rune consumed.
+func skipCSI(rs []rune, i int) int {
+	for i < len(rs) && rs[i] >= 0x20 && rs[i] <= 0x3f {
+		i++
+	}
+	if i < len(rs) && rs[i] >= 0x40 && rs[i] <= 0x7e {
+		return i
+	}
+	return i - 1
+}
+
+// skipStringSequence consumes an OSC/DCS/SOS/PM/APC payload starting at rs[i]
+// up to and including its BEL or ST terminator. An unterminated payload is
+// dropped up to the end of its line so it cannot swallow later output.
+func skipStringSequence(rs []rune, i int) int {
+	for ; i < len(rs); i++ {
+		switch {
+		case rs[i] == 0x07 || rs[i] == 0x9c:
+			return i
+		case rs[i] == 0x1b && i+1 < len(rs) && rs[i+1] == '\\':
+			return i + 1
+		case rs[i] == '\n':
+			return i - 1
+		}
+	}
+	return i
+}
+
+// isBidiControl reports whether r is a Unicode bidirectional formatting
+// control (marks, embeddings, overrides, and isolates).
+func isBidiControl(r rune) bool {
+	return r == 0x061c || r == 0x200e || r == 0x200f ||
+		(r >= 0x202a && r <= 0x202e) || (r >= 0x2066 && r <= 0x2069)
 }
