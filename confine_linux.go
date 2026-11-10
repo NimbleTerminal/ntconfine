@@ -63,7 +63,12 @@ const (
 	scopeSignal             = 1 << 1
 	scopeAll                = scopeAbstractUnixSocket | scopeSignal
 
+	// minLandlockABI is the lowest Landlock ABI accepted (Linux 6.2). ABI 3
+	// added LANDLOCK_ACCESS_FS_TRUNCATE; older kernels fail closed as unavailable.
+	minLandlockABI = 3
+
 	prSetNoNewPrivs = 38
+	fSetPipeSz      = 1031 // F_SETPIPE_SZ
 	oPath           = 0x200000
 
 	rlimitNproc            = 6
@@ -119,20 +124,18 @@ func socketpairCloexec() ([2]int, error) {
 	return fds, err
 }
 
-var availableOnce = sync.OnceValue(func() bool { return landlockABI() >= 1 })
+var availableOnce = sync.OnceValue(func() bool { return landlockABI() >= minLandlockABI })
 
-// Available reports whether Landlock is supported by the running Linux kernel.
+// Available reports whether the running Linux kernel supports Landlock ABI 3
+// or newer (Linux 6.2+).
 func Available() bool { return availableOnce() }
 
 // Probe reports the Linux Landlock + seccomp capability of the current host.
 func Probe() Support {
 	abi := landlockABI()
-	if abi >= 1 {
+	if abi >= minLandlockABI {
 		capped := min(abi, len(fsMaskForABI)-1)
 		detail := fmt.Sprintf("Linux Landlock ABI v%d + seccomp-bpf (TSYNC; FS_TRUNCATE + seccomp truncate/O_TRUNC filter)", capped)
-		if capped < 3 {
-			detail = fmt.Sprintf("Linux Landlock ABI v%d + seccomp-bpf (TSYNC; Landlock < v3 lacks FS_TRUNCATE, enforced via seccomp truncate/O_TRUNC filter)", capped)
-		}
 		return Support{
 			Available:   true,
 			Mechanism:   MechanismLandlock,
@@ -141,11 +144,15 @@ func Probe() Support {
 			Detail:      detail,
 		}
 	}
+	detail := "Linux Landlock is unavailable on this kernel"
+	if abi >= 1 {
+		detail = fmt.Sprintf("Linux Landlock ABI v%d is too old (ABI v%d / Linux 6.2 or newer is required)", abi, minLandlockABI)
+	}
 	return Support{
 		Available:  false,
 		Mechanism:  MechanismNone,
 		Deprecated: false,
-		Detail:     "Linux Landlock is unavailable on this kernel",
+		Detail:     detail,
 	}
 }
 
@@ -193,7 +200,7 @@ type ruleset struct {
 
 func newRuleset(denyNet bool) (*ruleset, error) {
 	abi := min(landlockABI(), len(fsMaskForABI)-1)
-	if abi < 1 {
+	if abi < minLandlockABI {
 		return nil, ErrUnavailable
 	}
 	for {
@@ -266,11 +273,12 @@ func (r *ruleset) restrict() error {
 	return nil
 }
 
-// maxInlinePipeSpecBytes is the maximum StageSpec size written synchronously
-// into the anonymous spec pipe before cmd.Start(). 4096 bytes matches Linux
-// PIPE_BUF and the single-page minimum pipe capacity guaranteed even when
-// pipe-user-pages-soft is exceeded, so pre-filling up to this size cannot block
-// and avoids spawning a background goroutine for unstarted Command(cfg) callers.
+// maxInlinePipeSpecBytes is the StageSpec size that always fits the anonymous
+// spec pipe before cmd.Start(). 4096 bytes matches Linux PIPE_BUF and the
+// single-page minimum pipe capacity guaranteed even when pipe-user-pages-soft
+// is exceeded. Larger specs first grow the pipe with F_SETPIPE_SZ so they can
+// also be written synchronously, which avoids leaving a blocked goroutine and
+// an open pipe behind when a Command(cfg) caller never starts the command.
 const maxInlinePipeSpecBytes = 4096
 
 func helperCommand(cfg HelperConfig, workerPath string, ephemeral bool) (*exec.Cmd, func(), error) {
@@ -302,7 +310,15 @@ func helperCommand(cfg HelperConfig, workerPath string, ephemeral bool) (*exec.C
 	if err != nil {
 		return nil, nil, err
 	}
-	if len(specB64) <= maxInlinePipeSpecBytes {
+	inline := len(specB64) <= maxInlinePipeSpecBytes
+	if !inline {
+		// Grow the pipe to hold the whole spec so the write below cannot block.
+		// If the kernel refuses (per-user pipe page limits), fall back to a
+		// background writer.
+		sz, _, errno := syscall.Syscall(syscall.SYS_FCNTL, pw.Fd(), fSetPipeSz, uintptr(len(specB64)))
+		inline = errno == 0 && int(sz) >= len(specB64)
+	}
+	if inline {
 		if _, err := io.WriteString(pw, specB64); err != nil {
 			_ = pw.Close()
 			_ = pr.Close()

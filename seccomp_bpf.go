@@ -78,9 +78,9 @@ func compileSeccompProgram(calls []uintptr, cloneNR, clone3NR, openNR, openatNR,
 			sockFilter{Code: bpfRET | bpfK, K: eperm},
 		)
 	}
-	// Block open(2) and openat(2) with O_TRUNC so a worker on Landlock ABI 1 or 2
-	// (which lacks LANDLOCK_ACCESS_FS_TRUNCATE) cannot truncate readable files via
-	// open(path, O_RDONLY|O_TRUNC).
+	// Block open(2) and openat(2) with O_TRUNC. Landlock ABI >= 3 (the minimum
+	// accepted) already enforces LANDLOCK_ACCESS_FS_TRUNCATE; this is kept as a
+	// second layer so open(path, O_RDONLY|O_TRUNC) never truncates a readable file.
 	if openNR != ^uint32(0) {
 		prog = append(prog,
 			sockFilter{Code: bpfJMP | bpfJEQ | bpfK, JT: 0, JF: 4, K: openNR},

@@ -300,7 +300,7 @@ func TestProbeReportsPlatformSupport(t *testing.T) {
 		}
 	case "linux":
 		if sup.Available {
-			if sup.Mechanism != MechanismLandlock || sup.LandlockABI < 1 {
+			if sup.Mechanism != MechanismLandlock || sup.LandlockABI < 3 {
 				t.Fatalf("linux support = %+v", sup)
 			}
 		}
