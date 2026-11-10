@@ -38,12 +38,12 @@ executables:
 1. **Closed-by-default `Policy`:** The zero `Policy` grants no readable,
    writable, or executable paths and sets `AllowUnsandboxed: false`.
 2. **`Policy.Validate()`:**
-   - Rejects empty `ExecPaths` and caps path list counts (`<= 128` per list) and
-     total path bytes (`<= 32768`).
+   - Rejects empty `ExecPaths` and caps the number of paths in each list and
+     the total length of all paths (see **Enforced limits** below).
    - Requires every path in `ReadPaths`, `WritePaths`, and `ExecPaths` to be
-     non-empty, valid UTF-8, free of NUL and control characters (`< 0x20`,
-     `0x7f`, or C1 `0x80`–`0x9f`), clean (`filepath.Clean(p) == p`, so no `.` or
-     `..` elements and no repeated or trailing separators), and absolute.
+     non-empty, valid UTF-8, free of NUL, C0 and C1 control characters, and DEL,
+     clean (`filepath.Clean(p) == p`, so no `.` or `..` elements and no repeated
+     or trailing separators), and absolute.
    - The same path check applies to `WorkerPath` and the stage binary path, and
      the Rust client's `StageSpec::validate` mirrors it.
 3. **`VerifyBinary` & `ResolveSibling`:**
@@ -58,11 +58,27 @@ executables:
 
 ---
 
+### Enforced limits
+
+<!-- BEGIN GENERATED:limits (edit the code, then run `task security-doc`) -->
+| Limit | Value | Set by |
+| --- | --- | --- |
+| Paths in each `Policy` list | 128 | `confine.MaxPolicyPaths` |
+| Total length of all `Policy` paths | 32 KiB | `confine.MaxPolicyPathBytes` |
+| Encoded `StageSpec` | 1 MiB | `confine.MaxSpecBytes` |
+| Captured worker `stderr` | 64 KiB | `confine.MaxStderrBytes` |
+| Linux `RLIMIT_NOFILE` default | 1024 | `Policy.MaxOpenFiles` |
+| Linux `RLIMIT_AS` default | 16 GiB | `Policy.MaxAddressSpace` |
+| Linux `RLIMIT_NPROC` default | 4096 | `Policy.MaxProcesses` |
+<!-- END GENERATED:limits -->
+
+---
+
 ## 3. Linux Confinement Perimeter (`landlock+seccomp`)
 
-On Linux (kernel $\ge 6.2$ with Landlock ABI $\ge 3$), `ntconfine` launches a
-small, pure-Go (`CGO_ENABLED=0`) stage process (`ntconfine-stage` or self-reexec
-via `--stage fd:<N>`) before `execve`ing the worker.
+On Linux, `ntconfine` launches a small, pure-Go (`CGO_ENABLED=0`) stage process
+(`ntconfine-stage` or self-reexec via `--stage fd:<N>`) before `execve`ing the
+worker. The minimum kernel is stated under **Landlock rules** below.
 
 ### Why a separate stage process is required
 Go (especially with CGO/`goffi`) and Rust hosts are already multi-threaded
@@ -72,69 +88,82 @@ threads before loading any worker libraries or executing worker code.
 
 ### Stage lockdown sequence (`RunStagePolicy`)
 1. **No policy paths in `argv`:** The parent passes the base64url-encoded JSON
-   `StageSpec` over an inherited anonymous pipe (`--stage fd:<N>`) capped at
-   `1 MiB` (`MaxSpecBytes`, enforced when encoding and when reading), and
-   closes the descriptor immediately after reading. Nothing
-   sensitive appears in `/proc/<pid>/cmdline` or `ps`.
-2. **Resource limits (`setrlimit`):**
-   - `RLIMIT_CORE = 0` (disables core dumps that could leak memory to disk).
-   - `RLIMIT_NOFILE = 1024` (configurable via `Policy.MaxOpenFiles`, clamped to hard limit).
-   - `RLIMIT_AS = 16 GiB` (configurable via `Policy.MaxAddressSpace`, clamped to hard limit).
-   - `RLIMIT_NPROC = 4096` (configurable via `Policy.MaxProcesses`, clamped to hard limit).
-3. **Landlock (`syscall.AllThreadsSyscall`):**
-   - Requires **Landlock ABI $\ge 3$** (Linux 6.2+). On ABI 1–2, which lack
-     `LANDLOCK_ACCESS_FS_TRUNCATE`, `Probe().Available` is `false`,
-     `Probe().Detail` names the kernel's ABI, and `StartHelper`, `Command`, and
-     the stage fail closed with `ErrUnavailable`.
-   - Handles filesystem access bits up to ABI 9 (including
-     `LANDLOCK_ACCESS_FS_TRUNCATE`, `LANDLOCK_ACCESS_FS_IOCTL_DEV`, and ABI 9's
-     `LANDLOCK_ACCESS_FS_RESOLVE_UNIX`), network masks (`LANDLOCK_ACCESS_NET_BIND_TCP`,
-     `CONNECT_TCP` at ABI $\ge 4$, plus UDP at ABI $\ge 10$ with automatic
-     fallback to ABI 6 if the kernel rejects unknown bits), and IPC scope flags
-     (`LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET`, `LANDLOCK_SCOPE_SIGNAL` at ABI $\ge 6$).
-   - Canonicalizes every existing path with `filepath.EvalSymlinks` before
-     adding `path_beneath` rules:
-     - `ReadPaths`: read-only (`READ_FILE | READ_DIR`).
-     - `WritePaths`: read-write (`READ_FILE | READ_DIR | WRITE_FILE | REMOVE_DIR | REMOVE_FILE | MAKE_DIR | MAKE_REG | MAKE_SYM | REFER | TRUNCATE`). Creating device nodes, sockets, and FIFOs (`MAKE_CHAR`, `MAKE_BLOCK`, `MAKE_SOCK`, `MAKE_FIFO`) is not granted.
-     - `ExecPaths` + `workerPath`: read + execute (`READ_FILE | READ_DIR | EXECUTE`).
-     - `/dev/null`: file read-write (`READ_FILE | WRITE_FILE | TRUNCATE`).
-   - Enforces `prctl(PR_SET_NO_NEW_PRIVS, 1)` and `landlock_restrict_self` across
-     all OS threads via `syscall.AllThreadsSyscall`.
-4. **Seccomp-BPF (`SECCOMP_SET_MODE_FILTER` with `SECCOMP_FILTER_TSYNC`):**
-   - Verifies `AUDIT_ARCH_X86_64` or `AUDIT_ARCH_AARCH64` (killing the process on
-     architecture mismatch and rejecting x32 ABI syscalls `>= 0x40000000` on amd64).
-   - Returns `ENOSYS` for `clone3` so `glibc` cleanly falls back to `clone(2)`.
-   - Inspects `clone(2)` flags (`arg0` on `amd64`/`arm64`) and returns `EPERM` if
-     any `CLONE_NEW*` namespace bit (`0x7e020080`) is set, while permitting
-     normal thread creation (`CLONE_VM | CLONE_THREAD | ...`).
-   - Inspects `tgkill(2)` and `tkill()` and returns `EPERM` unless `tgid == os.Getpid()`
-     (for `tgkill`), blocking cross-process thread signaling even on kernels
-     without Landlock ABI 6 while letting the Go/C runtime signal its own threads.
-   - Inspects `open(2)` (`amd64`) and `openat(2)` (`amd64`/`arm64`) flags and
-     returns `EPERM` if `O_TRUNC` (`0x200`) is set.
-   - Inspects `ioctl(2)` request codes (`uint32(cmd)`) and returns `EPERM` for
-     `FS_IOC_SETFLAGS` (`0x40086602`), `FS_IOC32_SETFLAGS` (`0x40046602`),
-     `FS_IOC_FSSETXATTR` (`0x401c5820`), and `TIOCSTI` (`0x00005412`).
-   - Denies with `EPERM`:
-     - **Network & IPC:** `socket`, `openat2`.
-     - **Cross-process signals & FD/memory inspection:** `kill`, `rt_sigqueueinfo`,
-       `rt_tgsigqueueinfo`, `pidfd_send_signal`, `pidfd_open`, `pidfd_getfd`,
-       `process_vm_readv`, `process_vm_writev`, `process_madvise`, `ptrace`, `kcmp`.
-     - **Namespaces, mounts & root changes:** `unshare`, `setns`, `mount`,
-       `umount2`, `pivot_root`, `chroot`, `open_tree`, `move_mount`, `fsopen`,
-       `fsconfig`, `fsmount`, `fspick`, `mount_setattr`.
-     - **Kernel attack surface & keyrings:** `bpf`, `io_uring_setup`,
-       `io_uring_enter`, `io_uring_register`, `userfaultfd`, `perf_event_open`,
-       `kexec_load`, `kexec_file_load`, `keyctl`, `add_key`, `request_key`.
-     - **Filesystem metadata mutation:** `truncate`, `chmod`,
-       `fchmod`, `fchmodat`, `fchmodat2`, `chown`, `lchown`, `fchown`,
-       `fchownat`, `utime`, `utimes`, `futimesat`, `utimensat`, `setxattr`,
-       `lsetxattr`, `fsetxattr`, `removexattr`, `lremovexattr`, `fremovexattr`.
-       `ftruncate` is **not** in this list: it needs a descriptor already open
-       for writing, which Landlock only permits under `Policy.WritePaths`.
+   `StageSpec` over an inherited anonymous pipe (`--stage fd:<N>`), size-capped
+   when encoding and when reading (see **Enforced limits**), and closes the
+   descriptor immediately after reading. Nothing sensitive appears in
+   `/proc/<pid>/cmdline` or `ps`.
+2. **Resource limits (`setrlimit`):** `RLIMIT_CORE` is set to zero, which
+   disables core dumps that could leak memory to disk. `RLIMIT_NOFILE`,
+   `RLIMIT_AS`, and `RLIMIT_NPROC` take the defaults under **Enforced limits**
+   unless the matching `Policy` field is set, and are clamped to the hard limit.
+3. **Landlock:** `prctl(PR_SET_NO_NEW_PRIVS, 1)` and `landlock_restrict_self`
+   are applied across all OS threads via `syscall.AllThreadsSyscall`. Every
+   existing path is canonicalized with `filepath.EvalSymlinks` before its
+   `path_beneath` rule is added. On a kernel below the minimum ABI,
+   `Probe().Available` is `false`, `Probe().Detail` names the kernel's ABI, and
+   `StartHelper`, `Command`, and the stage fail closed with `ErrUnavailable`.
+   The exact rights are under **Landlock rules** below.
+4. **Seccomp-BPF:** One filter is installed on all threads with
+   `SECCOMP_SET_MODE_FILTER` and `SECCOMP_FILTER_TSYNC`. Its exact contents are
+   under **Seccomp filter** below. `execve` stays allowed so the stage can
+   start the worker; Landlock limits what can be executed. `ftruncate` is not
+   denied because it needs a descriptor already open for writing, which
+   Landlock only permits under `Policy.WritePaths`.
 5. **Irreversible post-`restrict()` failure handling:** Once `landlock_restrict_self`
    succeeds, `RunStagePolicy` never returns to an in-process caller; if
    `seccomp-bpf` or `execve` fails, it writes to `stderr` and calls `os.Exit(1)`.
+
+### Landlock rules
+
+<!-- BEGIN GENERATED:landlock (edit the code, then run `task security-doc`) -->
+- **Minimum Landlock ABI:** 3 (Linux 6.2). Older kernels are reported as unavailable.
+- **Highest Landlock ABI requested:** 10. If a newer kernel rejects the request, the stage retries at ABI 6.
+
+| Granted on | Rights |
+| --- | --- |
+| `Policy.ReadPaths` | `LANDLOCK_ACCESS_FS_READ_FILE`, `LANDLOCK_ACCESS_FS_READ_DIR` |
+| `Policy.WritePaths` | `LANDLOCK_ACCESS_FS_WRITE_FILE`, `LANDLOCK_ACCESS_FS_READ_FILE`, `LANDLOCK_ACCESS_FS_READ_DIR`, `LANDLOCK_ACCESS_FS_REMOVE_DIR`, `LANDLOCK_ACCESS_FS_REMOVE_FILE`, `LANDLOCK_ACCESS_FS_MAKE_DIR`, `LANDLOCK_ACCESS_FS_MAKE_REG`, `LANDLOCK_ACCESS_FS_MAKE_SYM`, `LANDLOCK_ACCESS_FS_REFER`, `LANDLOCK_ACCESS_FS_TRUNCATE` |
+| `Policy.ExecPaths` and the worker binary | `LANDLOCK_ACCESS_FS_EXECUTE`, `LANDLOCK_ACCESS_FS_READ_FILE`, `LANDLOCK_ACCESS_FS_READ_DIR` |
+| `/dev/null` | `LANDLOCK_ACCESS_FS_WRITE_FILE`, `LANDLOCK_ACCESS_FS_READ_FILE`, `LANDLOCK_ACCESS_FS_TRUNCATE` |
+
+A path that is a file rather than a directory receives only the rights above that are also in: `LANDLOCK_ACCESS_FS_EXECUTE`, `LANDLOCK_ACCESS_FS_WRITE_FILE`, `LANDLOCK_ACCESS_FS_READ_FILE`, `LANDLOCK_ACCESS_FS_TRUNCATE`, `LANDLOCK_ACCESS_FS_IOCTL_DEV`.
+
+Every filesystem right the kernel's ABI supports is handled, so anything not granted above is denied:
+
+| From ABI | Rights handled |
+| --- | --- |
+| 1 | `LANDLOCK_ACCESS_FS_EXECUTE`, `LANDLOCK_ACCESS_FS_WRITE_FILE`, `LANDLOCK_ACCESS_FS_READ_FILE`, `LANDLOCK_ACCESS_FS_READ_DIR`, `LANDLOCK_ACCESS_FS_REMOVE_DIR`, `LANDLOCK_ACCESS_FS_REMOVE_FILE`, `LANDLOCK_ACCESS_FS_MAKE_CHAR`, `LANDLOCK_ACCESS_FS_MAKE_DIR`, `LANDLOCK_ACCESS_FS_MAKE_REG`, `LANDLOCK_ACCESS_FS_MAKE_SOCK`, `LANDLOCK_ACCESS_FS_MAKE_FIFO`, `LANDLOCK_ACCESS_FS_MAKE_BLOCK`, `LANDLOCK_ACCESS_FS_MAKE_SYM` |
+| 2 | `LANDLOCK_ACCESS_FS_REFER` |
+| 3 | `LANDLOCK_ACCESS_FS_TRUNCATE` |
+| 5 | `LANDLOCK_ACCESS_FS_IOCTL_DEV` |
+| 9 | `LANDLOCK_ACCESS_FS_RESOLVE_UNIX` |
+
+Network and IPC rights are handled with no allow rules, so they are denied outright:
+
+| From ABI | Denied |
+| --- | --- |
+| 4 | `LANDLOCK_ACCESS_NET_BIND_TCP`, `LANDLOCK_ACCESS_NET_CONNECT_TCP` |
+| 6 | `LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET`, `LANDLOCK_SCOPE_SIGNAL` |
+| 10 | `LANDLOCK_ACCESS_NET_BIND_UDP`, `LANDLOCK_ACCESS_NET_CONNECT_SEND_UDP` |
+<!-- END GENERATED:landlock -->
+
+### Seccomp filter
+
+<!-- BEGIN GENERATED:seccomp (edit the code, then run `task security-doc`) -->
+- **Architectures:** `amd64` (`AUDIT_ARCH` `0xc000003e`), `arm64` (`AUDIT_ARCH` `0xc00000b7`). A syscall from any other architecture, or with a number at or above `0x40000000` (the x32 ABI), kills the process.
+- **`clone3`** returns `ENOSYS`, so `glibc` falls back to `clone`, whose flags can be inspected.
+- **`clone`** returns `EPERM` if any namespace flag in `0x7e020080` (`CLONE_NEW*`) is set; ordinary thread and process creation is allowed.
+- **`open`** and **`openat`** return `EPERM` if `O_TRUNC` (`0x200`) is set.
+- **`ioctl`** returns `EPERM` for these request codes: `FS_IOC_SETFLAGS` (`0x40086602`), `FS_IOC32_SETFLAGS` (`0x40046602`), `FS_IOC_FSSETXATTR` (`0x401c5820`), `TIOCSTI` (`0x5412`).
+- **`tgkill`** and **`tkill`** return `EPERM` unless their first argument is the worker's own PID.
+- **Denied with `EPERM`:**
+  - **Network and IPC:** `socket`, `openat2`.
+  - **Cross-process signals and FD/memory inspection:** `kill`, `rt_sigqueueinfo`, `rt_tgsigqueueinfo`, `pidfd_send_signal`, `pidfd_open`, `pidfd_getfd`, `process_vm_readv`, `process_vm_writev`, `process_madvise`, `ptrace`, `kcmp`.
+  - **Namespaces, mounts, and root changes:** `unshare`, `setns`, `mount`, `umount2`, `pivot_root`, `chroot`, `open_tree`, `move_mount`, `fsopen`, `fsconfig`, `fsmount`, `fspick`, `mount_setattr`.
+  - **Kernel attack surface and keyrings:** `init_module`, `finit_module`, `bpf`, `io_uring_setup`, `io_uring_enter`, `io_uring_register`, `userfaultfd`, `perf_event_open`, `kexec_load`, `kexec_file_load`, `keyctl`, `add_key`, `request_key`.
+  - **Filesystem metadata mutation:** `truncate`, `chmod`, `fchmod`, `fchmodat`, `fchmodat2`, `chown`, `lchown`, `fchown`, `fchownat`, `utime`, `utimes`, `futimesat`, `utimensat`, `setxattr`, `lsetxattr`, `fsetxattr`, `removexattr`, `lremovexattr`, `fremovexattr`.
+- **Not present on `arm64`** (the kernel has no such syscall there): `chmod`, `chown`, `lchown`, `utime`, `utimes`, `futimesat`.
+<!-- END GENERATED:seccomp -->
 
 ---
 
@@ -160,16 +189,48 @@ On macOS, `ntconfine` generates a Seatbelt (`(version 1)`) profile via
    policy's allowed paths (plus `/tmp`, `/var`, and `/private`; `/` itself is
    readable through `dyld-support.sb`). Both `open(2)` and `stat(2)` on `/etc/passwd`,
    `$HOME`, and `~/.ssh` fail with `EPERM`.
-4. **Denied capabilities:** Network (`(deny network*)`), Mach lookup/register
-   (`(deny mach-lookup)` / `(deny mach-register)`), POSIX shared memory
-   (`(deny ipc-posix-shm*)`), core dumps (`(deny file-write* (subpath "/cores"))`),
-   and controlling terminal (`(deny file-read* file-write* (literal "/dev/tty"))`,
-   emitted after the path allows).
+4. **Denied capabilities:** Network, Mach lookup and registration, POSIX shared
+   memory, writes under `/cores` (core dumps), and the controlling terminal
+   `/dev/tty`. The terminal and network denies are emitted after the path
+   allows. The exact rules are in the example profile below.
 5. **Known OS caveats (`Probe().Deprecated == true`):**
    - Apple marks `/usr/bin/sandbox-exec` as deprecated.
    - The Darwin kernel does not enforce `setrlimit(RLIMIT_AS)`. Hosts on macOS
      must enforce per-request deadlines and payload size bounds in their
      application protocol.
+
+### Example profile
+
+This is the exact profile `HelperPolicy` emits for a policy with one read path
+(`/opt/ntconfine-example/input`), one write path (`/opt/ntconfine-example/output`),
+and one executable (`/opt/ntconfine-example/worker`). A path that exists and is
+a directory is emitted as `(subpath ...)` where this example shows `(literal ...)`.
+
+<!-- BEGIN GENERATED:macos-profile (edit the code, then run `task security-doc`) -->
+```scheme
+(version 1)
+(deny default)
+(import "dyld-support.sb")
+(allow syscall*)
+(allow system-mac-syscall)
+(allow mach-bootstrap)
+(deny mach-lookup)
+(deny mach-register)
+(deny ipc-posix-shm*)
+(deny file-write* (subpath "/cores"))
+(deny file-read* file-test-existence (subpath "/private/etc") (subpath "/etc") (subpath "/Users") (subpath "/private/var/root"))
+(allow process-exec (literal "/opt/ntconfine-example/worker"))
+(allow signal (target self))
+(allow sysctl-read)
+(allow file-read* file-test-existence file-map-executable (literal "/opt/ntconfine-example/worker") (literal "/opt/ntconfine-example/input"))
+(allow file-read* file-write* file-test-existence (literal "/opt/ntconfine-example/output"))
+(allow file-read-metadata file-test-existence (literal "/tmp") (literal "/var") (literal "/private") (literal "/opt/ntconfine-example") (literal "/opt") (literal "/"))
+(allow file-read* file-write* file-test-existence (literal "/dev/null"))
+(allow file-read* file-test-existence (literal "/dev/urandom") (literal "/dev/random"))
+(deny file-read* file-write* (literal "/dev/tty"))
+(deny network*)
+```
+<!-- END GENERATED:macos-profile -->
 
 ---
 
@@ -189,8 +250,8 @@ On macOS, `ntconfine` generates a Seatbelt (`(version 1)`) profile via
 - **Process-group termination:** `Helper.Close()` and `Process.Close()` close the
   IPC connection, send `SIGKILL` to both `-pid` (the entire process group) and
   `pid`, and reap the child with `Wait()`.
-- **Bounded, sanitized `stderr`:** Worker `stderr` is captured into a 64 KiB
-  `BoundedBuffer` (`MaxStderrBytes`). `Helper.Stderr()`, `Process.Stderr()`, and
+- **Bounded, sanitized `stderr`:** Worker `stderr` is captured into a
+  size-capped `BoundedBuffer` (see **Enforced limits**). `Helper.Stderr()`, `Process.Stderr()`, and
   the Rust `Process::stderr()` return it through `SanitizeTerminalText`, which
   removes whole ANSI escape sequences (CSI, OSC, DCS, SOS, PM, APC), all other
   C0/C1 controls except newline and tab, DEL, Unicode bidi marks, embeddings,
@@ -214,5 +275,9 @@ When modifying `ntconfine`, verify every item below:
 - [ ] **No `system.sb` or unfiltered `file-read-metadata` on macOS:**
       `TestDarwinHelperPolicyHardening` and `TestDarwinStageDoesNotLeakPolicyPathsInPs`
       must pass on macOS.
+- [ ] **Facts come from code:** Every number, mask, syscall name, Landlock
+      right, and Seatbelt rule in this file lives in a `GENERATED` region that
+      `TestSecurityDocInSync` renders from the code. Change the code, run
+      `task security-doc`, and never restate such a fact in the prose.
 - [ ] **Preflight gate:** Run `task ci` (and `task test-sandbox-linux` when
       Docker is available) before committing.

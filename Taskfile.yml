@@ -120,6 +120,16 @@ tasks:
       - go run ./internal/tools/notices > dist/THIRD_PARTY_NOTICES.md
       - cmp THIRD_PARTY_NOTICES.md dist/THIRD_PARTY_NOTICES.md
 
+  security-doc:
+    desc: Regenerate the code-derived regions of SECURITY.md (run on macOS and Linux to cover every region)
+    cmds:
+      - go test -count=1 -run '^TestSecurityDocInSync$' . -update-security-doc
+
+  security-doc-check:
+    desc: Check that SECURITY.md matches the code without modifying it
+    cmds:
+      - go test -count=1 -run '^TestSecurityDocInSync$' .
+
   lint:
     desc: Run golangci-lint across root and pkg/confine
     cmds:
@@ -142,9 +152,10 @@ tasks:
       - docker run --rm -v "$PWD":/src -w /src -e CGO_ENABLED=0 -e NTCONFINE_REQUIRE_SANDBOX=1 --security-opt seccomp=unconfined golang:1.26 go test . -count=1
 
   check:
-    desc: vet, test, wasm, windows, linux, notices-check
+    desc: vet, security-doc-check, test, wasm, windows, linux, notices-check
     cmds:
       - task: vet
+      - task: security-doc-check
       - task: test
       - task: wasm
       - task: windows
