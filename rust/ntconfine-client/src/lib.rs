@@ -8,6 +8,7 @@
 
 use std::ffi::c_int;
 use std::io::{self, Read, Write};
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
@@ -50,6 +51,175 @@ impl Policy {
     }
 }
 
+/// Maximum number of entries in each [`Policy`] path list.
+pub const MAX_POLICY_PATHS: usize = 128;
+
+/// Maximum total byte length of all [`Policy`] paths.
+pub const MAX_POLICY_PATH_BYTES: usize = 32768;
+
+/// Maximum encoded [`StageSpec`] size accepted by `ntconfine-stage`.
+pub const MAX_SPEC_BYTES: usize = 1 << 20;
+
+/// Maximum stderr output retained from the stage and worker.
+pub const MAX_STDERR_BYTES: usize = 64 << 10;
+
+fn invalid_input(msg: String) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, msg)
+}
+
+fn validate_clean_abs_path(path: &str) -> io::Result<()> {
+    if !path.starts_with('/') {
+        return Err(invalid_input(format!(
+            "ntconfine: invalid path {path:?} (must be absolute)"
+        )));
+    }
+    if path.chars().any(|c| c.is_control()) {
+        return Err(invalid_input(format!(
+            "ntconfine: control character in path {path:?}"
+        )));
+    }
+    if path != "/" {
+        for part in path[1..].split('/') {
+            if part.is_empty() || part == "." || part == ".." {
+                return Err(invalid_input(format!(
+                    "ntconfine: path {path:?} is not clean"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Resolves symlinks on `path` and applies the same checks as the Go
+/// `VerifyBinary`: a regular executable file that is not group- or
+/// world-writable, not setuid/setgid, owned by the effective UID or root, in a
+/// directory that is not world-writable unless sticky.
+fn verify_binary(path: &Path) -> io::Result<std::path::PathBuf> {
+    let resolved = std::fs::canonicalize(path)?;
+    let meta = std::fs::metadata(&resolved)?;
+    let shown = resolved.display();
+    if !meta.is_file() {
+        return Err(invalid_input(format!(
+            "ntconfine: binary {shown} is not a regular file"
+        )));
+    }
+    let mode = meta.mode();
+    if mode & 0o111 == 0 {
+        return Err(invalid_input(format!(
+            "ntconfine: binary {shown} is not executable"
+        )));
+    }
+    if mode & 0o022 != 0 {
+        return Err(invalid_input(format!(
+            "ntconfine: binary {shown} is group- or world-writable"
+        )));
+    }
+    if mode & 0o6000 != 0 {
+        return Err(invalid_input(format!(
+            "ntconfine: binary {shown} has setuid/setgid bit set"
+        )));
+    }
+    let euid = unsafe { geteuid() };
+    if meta.uid() != euid && meta.uid() != 0 {
+        return Err(invalid_input(format!(
+            "ntconfine: binary {shown} has untrusted owner uid {}",
+            meta.uid()
+        )));
+    }
+    if let Some(dir) = resolved.parent() {
+        let dir_mode = std::fs::metadata(dir)?.mode();
+        if dir_mode & 0o002 != 0 && dir_mode & 0o1000 == 0 {
+            return Err(invalid_input(format!(
+                "ntconfine: parent directory {} is world-writable without sticky bit",
+                dir.display()
+            )));
+        }
+    }
+    Ok(resolved)
+}
+
+/// Makes untrusted process output safe to print on a terminal, matching the Go
+/// `confine.SanitizeTerminalText`: removes whole ANSI escape sequences, all
+/// other C0/C1 controls except newline and tab, DEL, Unicode bidirectional
+/// formatting controls, and U+FFFD, then trims surrounding whitespace.
+pub fn sanitize_terminal_text(raw: &str) -> String {
+    let rs: Vec<u32> = raw.chars().map(|c| c as u32).collect();
+    let mut out = String::with_capacity(raw.len());
+    let mut i = 0usize;
+    while i < rs.len() {
+        let r = rs[i];
+        if r == 0x1b && i + 1 < rs.len() {
+            i = skip_escape_sequence(&rs, i + 1);
+        } else if r == 0x9b {
+            i = skip_csi(&rs, i + 1);
+        } else if matches!(r, 0x90 | 0x98 | 0x9d | 0x9e | 0x9f) {
+            i = skip_string_sequence(&rs, i + 1);
+        } else if r == 0xfffd || is_bidi_control(r) {
+            // dropped
+        } else if r == 0x0a
+            || r == 0x09
+            || (r >= 0x20 && r != 0x7f && !(0x80..=0x9f).contains(&r))
+        {
+            if let Some(c) = char::from_u32(r) {
+                out.push(c);
+            }
+        }
+        i += 1;
+    }
+    out.trim().to_string()
+}
+
+// The skip_* helpers take the index just past the introducer (always >= 1) and
+// return the index of the last element they consume.
+fn skip_escape_sequence(rs: &[u32], mut i: usize) -> usize {
+    match rs[i] {
+        0x5b => return skip_csi(rs, i + 1),
+        0x5d | 0x50 | 0x58 | 0x5e | 0x5f => return skip_string_sequence(rs, i + 1),
+        _ => {}
+    }
+    while i < rs.len() && (0x20..=0x2f).contains(&rs[i]) {
+        i += 1;
+    }
+    if i < rs.len() && (0x30..=0x7e).contains(&rs[i]) {
+        return i;
+    }
+    i - 1
+}
+
+fn skip_csi(rs: &[u32], mut i: usize) -> usize {
+    while i < rs.len() && (0x20..=0x3f).contains(&rs[i]) {
+        i += 1;
+    }
+    if i < rs.len() && (0x40..=0x7e).contains(&rs[i]) {
+        return i;
+    }
+    i - 1
+}
+
+fn skip_string_sequence(rs: &[u32], mut i: usize) -> usize {
+    while i < rs.len() {
+        if rs[i] == 0x07 || rs[i] == 0x9c {
+            return i;
+        }
+        if rs[i] == 0x1b && i + 1 < rs.len() && rs[i + 1] == 0x5c {
+            return i + 1;
+        }
+        if rs[i] == 0x0a {
+            return i - 1;
+        }
+        i += 1;
+    }
+    i
+}
+
+fn is_bidi_control(r: u32) -> bool {
+    r == 0x061c
+        || r == 0x200e
+        || r == 0x200f
+        || (0x202a..=0x202e).contains(&r)
+        || (0x2066..=0x2069).contains(&r)
+}
+
 /// Wire payload passed to `ntconfine-stage --stage fd:N`.
 #[derive(Clone, Debug)]
 pub struct StageSpec {
@@ -68,6 +238,39 @@ impl StageSpec {
             worker_args,
             policy,
         }
+    }
+
+    /// Checks the spec the way `pkg/confine` does before launch: `worker_path`
+    /// and every policy path must be absolute, free of control characters, and
+    /// already clean (no `.`/`..` elements, repeated or trailing separators);
+    /// each path list holds at most [`MAX_POLICY_PATHS`] entries and all policy
+    /// paths together are at most [`MAX_POLICY_PATH_BYTES`] bytes.
+    pub fn validate(&self) -> io::Result<()> {
+        validate_clean_abs_path(&self.worker_path)?;
+        let mut total = 0usize;
+        for list in [
+            &self.policy.read_paths,
+            &self.policy.write_paths,
+            &self.policy.exec_paths,
+        ] {
+            if list.len() > MAX_POLICY_PATHS {
+                return Err(invalid_input(format!(
+                    "ntconfine: policy path list has {} entries (max {})",
+                    list.len(),
+                    MAX_POLICY_PATHS
+                )));
+            }
+            for path in list {
+                total += path.len();
+                if total > MAX_POLICY_PATH_BYTES {
+                    return Err(invalid_input(format!(
+                        "ntconfine: policy paths exceed {MAX_POLICY_PATH_BYTES} bytes in total"
+                    )));
+                }
+                validate_clean_abs_path(path)?;
+            }
+        }
+        Ok(())
     }
 
     /// Serializes this [`StageSpec`] as unpadded URL-safe base64 JSON matching
@@ -177,10 +380,11 @@ pub struct Process {
 }
 
 impl Process {
-    /// Returns the captured stderr output (up to 64 KiB) from the stage and worker.
+    /// Returns the captured stderr output (up to 64 KiB) from the stage and
+    /// worker, sanitized with [`sanitize_terminal_text`].
     pub fn stderr(&self) -> String {
         let guard = self.stderr_buf.lock().unwrap_or_else(|e| e.into_inner());
-        String::from_utf8_lossy(&guard).into_owned()
+        sanitize_terminal_text(&String::from_utf8_lossy(&guard))
     }
 
     /// Closes the IPC socket, terminates the confined process group, and waits
@@ -224,22 +428,18 @@ pub fn start_stage(stage_path: impl AsRef<Path>, spec: &StageSpec) -> io::Result
             "ntconfine: stage_path is required",
         ));
     }
-    let meta = std::fs::metadata(stage_path)?;
-    if !meta.is_file() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "ntconfine: stage_path is not a regular file",
-        ));
-    }
+    let stage_path = verify_binary(stage_path)?;
+    spec.validate()?;
 
     let encoded = spec.encode()?;
+    if encoded.len() > MAX_SPEC_BYTES {
+        return Err(invalid_input(format!(
+            "ntconfine: encoded stage spec exceeds {MAX_SPEC_BYTES} bytes"
+        )));
+    }
     let (parent_sock, child_sock) = UnixStream::pair()?;
     let fork_guard = SPAWN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (spec_r, mut spec_w) = os_pipe()?;
-
-    spec_w.write_all(encoded.as_bytes())?;
-    spec_w.write_all(b"\n")?;
-    drop(spec_w);
 
     let child_sock_fd = child_sock.as_raw_fd();
     let spec_r_fd = spec_r.as_raw_fd();
@@ -307,6 +507,15 @@ pub fn start_stage(stage_path: impl AsRef<Path>, spec: &StageSpec) -> io::Result
     drop(fork_guard);
     let mut child = spawn_res?;
 
+    // Feed the spec only after the stage is running and from its own thread, so
+    // a spec larger than the pipe buffer cannot block the caller. A stage that
+    // exits early closes the read end and the write fails; that failure shows
+    // up to the caller as EOF on `conn` plus the stage's stderr.
+    thread::spawn(move || {
+        let _ = spec_w.write_all(encoded.as_bytes());
+        let _ = spec_w.write_all(b"\n");
+    });
+
     let stderr_buf = Arc::new(Mutex::new(Vec::new()));
     let stderr_thread = child.stderr.take().map(|mut stderr| {
         let buf = Arc::clone(&stderr_buf);
@@ -317,7 +526,7 @@ pub fn start_stage(stage_path: impl AsRef<Path>, spec: &StageSpec) -> io::Result
                     break;
                 }
                 let mut guard = buf.lock().unwrap_or_else(|e| e.into_inner());
-                let rem = 65536usize.saturating_sub(guard.len());
+                let rem = MAX_STDERR_BYTES.saturating_sub(guard.len());
                 if rem == 0 {
                     continue;
                 }
@@ -445,5 +654,52 @@ extern "C" {
     fn close(fd: c_int) -> c_int;
     fn fcntl(fd: c_int, cmd: c_int, ...) -> c_int;
     fn setsid() -> c_int;
+    fn geteuid() -> u32;
     fn kill(pid: c_int, sig: c_int) -> c_int;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sanitize_strips_sequences_and_bidi() {
+        for (input, want) in [
+            ("plain\ttext\nline two", "plain\ttext\nline two"),
+            ("a\x1b[1;31mb\x1b[0mc", "abc"),
+            ("a\x1b]0;title\x07b", "ab"),
+            ("a\x1bPpayload\x1b\\b", "ab"),
+            ("a\x1b]unterminated\nnext", "a\nnext"),
+            ("a\u{9b}31mb", "ab"),
+            ("a\x1b(Bb", "ab"),
+            ("a\x1b", "a"),
+            ("a\x1b[", "a"),
+            ("safe\u{202e}gnp.exe", "safegnp.exe"),
+            ("a\u{2066}b\u{2069}c\u{200e}\u{200f}\u{61c}", "abc"),
+            ("a\x7f\x00\rc", "ac"),
+        ] {
+            assert_eq!(sanitize_terminal_text(input), want, "input {input:?}");
+        }
+    }
+
+    #[test]
+    fn validate_rejects_unclean_and_oversized() {
+        let ok = StageSpec::new("/bin/true", vec![], Policy::default());
+        assert!(ok.validate().is_ok());
+        for bad in ["", "rel/path", "/a/../etc", "/a/./b", "/a//b", "/a/", "/a\nb"] {
+            let mut pol = Policy::default();
+            pol.read_paths.push(bad.to_string());
+            assert!(
+                StageSpec::new("/bin/true", vec![], pol).validate().is_err(),
+                "accepted {bad:?}"
+            );
+            assert!(
+                StageSpec::new(bad, vec![], Policy::default()).validate().is_err(),
+                "accepted worker {bad:?}"
+            );
+        }
+        let mut pol = Policy::default();
+        pol.read_paths = vec!["/r".to_string(); MAX_POLICY_PATHS + 1];
+        assert!(StageSpec::new("/bin/true", vec![], pol).validate().is_err());
+    }
 }
