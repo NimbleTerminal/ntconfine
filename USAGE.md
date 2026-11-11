@@ -135,6 +135,13 @@ func main() {
 > `./cmd/ntconfine-stage` with `CGO_ENABLED=0` and place it beside your host
 > binary. Leave `HelperConfig.StagePath` empty and `StartHelper` will resolve it
 > automatically via `ResolveSibling("ntconfine-stage")`.
+>
+> A stage linked with cgo cannot confine its threads and fails closed with
+> `ErrCgoStage`. `StartHelper` and `Command` return it up front when the host
+> names its own cgo-linked executable as the stage. Any other cgo-linked stage
+> exits with that message on its stderr, available from `Helper.Stderr()`. This
+> includes `go test` binaries on Linux when cgo is enabled and a dependency
+> links it, so run such tests with `CGO_ENABLED=0`.
 
 ### Passing extra file descriptors (`ExtraFiles`)
 

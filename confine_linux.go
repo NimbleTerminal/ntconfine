@@ -228,6 +228,28 @@ func (r *ruleset) restrict() error {
 // an open pipe behind when a Command(cfg) caller never starts the command.
 const maxInlinePipeSpecBytes = 4096
 
+// cgoLinked reports whether this program is linked with cgo, by asking the
+// runtime for the facility the stage depends on: syscall.AllThreadsSyscall
+// returns ENOTSUP in such a program without making the call. Having cgo
+// enabled at build time is not enough to tell, since a program that links no
+// cgo package is unaffected. Tests replace it.
+var cgoLinked = sync.OnceValue(func() bool {
+	_, _, errno := syscall.AllThreadsSyscall(syscall.SYS_GETPID, 0, 0, 0)
+	return errno == syscall.ENOTSUP
+})
+
+// stageIsSelf reports whether stagePath is this program's own executable, as
+// when a host re-executes itself as the stage.
+func stageIsSelf(stagePath string) bool {
+	self, err := os.Executable()
+	if err != nil {
+		return false
+	}
+	a, errA := os.Stat(self)
+	b, errB := os.Stat(stagePath)
+	return errA == nil && errB == nil && os.SameFile(a, b)
+}
+
 func helperCommand(cfg HelperConfig, workerPath string, ephemeral bool) (*exec.Cmd, func(), error) {
 	stagePath := cfg.StagePath
 	var err error
@@ -238,6 +260,12 @@ func helperCommand(cfg HelperConfig, workerPath string, ephemeral bool) (*exec.C
 	}
 	if err != nil {
 		return nil, nil, err
+	}
+	// A host that re-executes itself as the stage can tell now that the stage
+	// would refuse to run. Reporting it here names the cause; otherwise the
+	// caller sees only its connection to the worker close.
+	if stageIsSelf(stagePath) && cgoLinked() {
+		return nil, nil, ErrCgoStage
 	}
 	pol := cfg.Policy
 	if !slices.Contains(pol.ExecPaths, workerPath) {
@@ -376,6 +404,12 @@ func applyResourceLimits(pol Policy) error {
 func RunStagePolicy(pol Policy, workerPath string, workerArgs []string) error {
 	if err := pol.Validate(); err != nil {
 		return err
+	}
+	// Checked before anything is applied: in a cgo-linked stage the Landlock
+	// and seccomp calls below cannot reach every thread and would fail with a
+	// bare "operation not supported".
+	if cgoLinked() {
+		return ErrCgoStage
 	}
 	resolvedWorker, err := VerifyBinary(workerPath)
 	if err != nil {

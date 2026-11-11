@@ -8,6 +8,7 @@
 package ntconfine
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -34,6 +35,13 @@ const (
 
 // ErrUnavailable means this machine cannot enforce the requested OS sandbox policy.
 var ErrUnavailable = confine.ErrUnavailable
+
+// ErrCgoStage means the Linux stage process is linked with cgo. The stage
+// confines every thread of its own process, which the Go runtime only supports
+// in a program built without cgo. Build ./cmd/ntconfine-stage with
+// CGO_ENABLED=0 and name it in HelperConfig.StagePath, or place it beside the
+// host binary and leave StagePath empty.
+var ErrCgoStage = errors.New("ntconfine: the stage binary is linked with cgo and cannot confine its threads; build ./cmd/ntconfine-stage with CGO_ENABLED=0 and use it as the stage")
 
 // Mechanism names the OS sandbox mechanism used to confine a worker process.
 type Mechanism = confine.Mechanism
